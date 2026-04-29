@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  StockPulse — Serverless Market Data Aggregator
+  Zero idle cost. Scales to zero when not in use.
+
+# ─── Global defaults applied to all Lambda functions ─────────────────────────
+Globals:
+  Function:
+    Runtime:      python3.12
+    MemorySize:   256
+    Timeout:      30
+    Architectures: [arm64]   # Graviton2 — 20% cheaper than x86
+    Layers:
+      - !Ref SharedLayer
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref StockPulseTable
+        POWERTOOLS_SERVICE_NAME: stockpulse
+        LOG_LEVEL: INFO
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: "'*'"
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+  AlphaVantageKey:
+    Type:        String
+    NoEcho:      true
+    Description: Alpha Vantage API key (free at alphavantage.co)
+
+  StocksToTrack:
+    Type:        String
+    Default:     "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,GS,BAC"
+    Description: Comma-separated list of stock symbols to ingest
+
+  Environment:
+    Type:        String
+    Default:     prod
+    AllowedValues: [prod, dev]
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB — single-table design ─────────────────────────────────────────
+  StockPulseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "stockpulse-${Environment}"
+      BillingMode: PAY_PER_REQUEST   # On-demand — $0 when idle
+      TableClass: STANDARD_INFREQUENT_ACCESS
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType:        HASH
+        - AttributeName: sk
+          KeyType:        RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: date-index
+          KeySchema:
+            - AttributeName: gsi_date
+              KeyType:        HASH
+            - AttributeName: sk
+              KeyType:        RANGE
+          Projection:
+            ProjectionType: ALL
+      # TTL: auto-expire raw 5-min price records after 30 days
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: StockPulse
+
+  # ── Lambda Layer — shared Python utilities ──────────────────────────────────
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: stockpulse-shared
+      Description: Shared utilities — DynamoDB client, models, helpers
+      ContentUri: ../backend/shared/
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Delete
+
+  # ── Ingestor Lambda ─────────────────────────────────────────────────────────
+  IngestorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stockpulse-ingestor-${Environment}"
+      CodeUri:      ../backend/lambdas/ingestor/
+      Handler:      handler.lambda_handler
+      Description:  Fetches OHLCV data from Alpha Vantage; writes to DynamoDB
+      Timeout:      120   # batch fetch can take up to 2 min
+      Environment:
+        Variables:
+          ALPHA_VANTAGE_KEY: !Ref AlphaVantageKey
+          STOCKS_TO_TRACK:   !Ref StocksToTrack
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref StockPulseTable
+        - CloudWatchPutMetricPolicy: {}
+      Events:
+        # Every 5 minutes, Mon–Fri 9:25–20:05 ET (UTC-4/5)
+        MarketHoursSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(25,30,35,40,45,50,55 13,14,15,16,17,18,19,20 ? * MON-FRI *)"
+            Description: Ingest during market hours
+            Enabled: true
+        # Once daily pre-market for overnight data
+        PreMarketSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 9 ? * MON-FRI *)"
+            Description: Pre-market daily ingest
+            Enabled: true
+
+  # ── Fetcher Lambda (API Gateway proxy) ─────────────────────────────────────
+  FetcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stockpulse-fetcher-${Environment}"
+      CodeUri:      ../backend/lambdas/fetcher/
+      Handler:      handler.lambda_handler
+      Description:  REST API handler — reads price data from DynamoDB
+      Timeout:      10
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref StockPulseTable
+      Events:
+        ListStocks:
+          Type: Api
+          Properties:
+            Path:   /stocks
+            Method: GET
+        GetStock:
+          Type: Api
+          Properties:
+            Path:   /stocks/{symbol}
+            Method: GET
+        GetHistory:
+          Type: Api
+          Properties:
+            Path:   /stocks/{symbol}/history
+            Method: GET
+        GetAggregates:
+          Type: Api
+          Properties:
+            Path:   /stocks/{symbol}/aggregates
+            Method: GET
+        GetAlerts:
+          Type: Api
+          Properties:
+            Path:   /stocks/{symbol}/alerts
+            Method: GET
+        CreateAlert:
+          Type: Api
+          Properties:
+            Path:   /stocks/{symbol}/alerts
+            Method: POST
+
+  # ── Aggregator Lambda ───────────────────────────────────────────────────────
+  AggregatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stockpulse-aggregator-${Environment}"
+      CodeUri:      ../backend/lambdas/aggregator/
+      Handler:      handler.lambda_handler
+      Description:  Computes daily OHLC summaries and 20/50-day moving averages
+      Timeout:      180
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StockPulseTable
+      Events:
+        DailyClose:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(30 21 ? * MON-FRI *)"
+            Description: Run after market close (21:30 UTC = 4:30 PM ET)
+            Enabled: true
+
+  # ── Alerting Lambda ─────────────────────────────────────────────────────────
+  AlertingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stockpulse-alerting-${Environment}"
+      CodeUri:      ../backend/lambdas/alerting/
+      Handler:      handler.lambda_handler
+      Description:  Monitors price thresholds and publishes SNS notifications
+      Timeout:      30
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref StockPulseTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+      Environment:
+        Variables:
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+      Events:
+        CheckAlerts:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(*/5 13-21 ? * MON-FRI *)"
+            Description: Check price alerts every 5 min during market hours
+            Enabled: true
+
+  # ── SNS Topic for price alerts ──────────────────────────────────────────────
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "stockpulse-alerts-${Environment}"
+      DisplayName: StockPulse Price Alerts
+
+  # ── CloudWatch Alarms ───────────────────────────────────────────────────────
+  IngestorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "stockpulse-ingestor-errors-${Environment}"
+      AlarmDescription: Ingestor Lambda error rate > 5% in 15 min
+      Namespace:   AWS/Lambda
+      MetricName:  Errors
+      Dimensions:
+        - Name:  FunctionName
+          Value: !Ref IngestorFunction
+      Statistic:          Sum
+      Period:             900
+      EvaluationPeriods:  1
+      Threshold:          3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData:   notBreaching
+
+  # ── S3 Bucket for frontend hosting ─────────────────────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stockpulse-frontend-${AWS::AccountId}-${Environment}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:       false
+        BlockPublicPolicy:     false
+        IgnorePublicAcls:      false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect:    Allow
+            Principal: "*"
+            Action:    "s3:GetObject"
+            Resource:  !Sub "${FrontendBucket.Arn}/*"
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  DynamoTableName:
+    Description: DynamoDB table name
+    Value: !Ref StockPulseTable
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend deployment
+    Value: !Ref FrontendBucket
+
+  AlertsTopicArn:
+    Description: SNS topic ARN for price alerts
+    Value: !Ref AlertsTopic

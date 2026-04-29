@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Node
+node_modules/
+dist/
+.env
+.env.local
+.vite/
+
+# AWS
+.aws-sam/
+samconfig.toml.bak
+packaged.yaml
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
